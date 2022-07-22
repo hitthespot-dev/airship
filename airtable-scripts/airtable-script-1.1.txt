@@ -1,0 +1,324 @@
+const scriptConfig = {
+    version: "1.0",
+    shop: "{{{shop}}}",
+    endpoint: "{{{endpoint}}}"
+};
+
+const apiUrls = {
+    dataMapping: scriptConfig.endpoint + "data-mapping/update",
+    s2a: scriptConfig.endpoint + "full_sync_s2a",
+    onS2a: scriptConfig.endpoint + "enable_s2a",
+    offS2a: scriptConfig.endpoint + "disable_s2a",
+    a2sPeview: scriptConfig.endpoint + "sync/session/" + scriptConfig.shop + "/" + base.id
+}
+
+// For app ui
+const ui = input.config({
+    title: "🚢 Airship Script",
+    description:
+    `Select the Script Actions and click the Run button.\n
+    CAUTION:\n
+    1. This script requires "Creator" permission, the user who running the script would need to have corresponding permission levels.
+    2. Do not modify the data in Metadata table. If your table schema changes, you should use "Setup Tables & Metadata" action to update the metadata
+    `,
+    items: [
+        input.config.select("action", {
+            label: "Script Actions",
+            description: "Select the action you want the script to execute",
+            options: [
+                {label: "Setup Tables & Metadata", value: "setup_metadata"},
+                {label: "Full sync from Shopify -> Airtable", value: "full_sync_s2a"},
+                {label: "Trigger Airtable -> Shopify sync", value: "full_sync_a2s"},
+                {label: "Enable Shopify -> Airtable sync", value: "on_s2a"},
+                {label: "Disable Shopify -> Airtable sync", value: "off_s2a"}
+            ]
+        })
+    ]
+})
+
+const airshipTables = [
+    {
+        tableId: "metadataTable",
+        tableName: "🚢 Metadata",
+        fields: [
+            {key: "id", name: "Id", type: "singleLineText"},
+            {key: "tableName", name: "Table Name", type: "singleLineText"},
+            {key: "fieldName", name: "Field Name", type: "singleLineText"},
+            {key: "fieldType", name: "Field Type", type: "singleLineText"},
+            {key: "fieldDescription", name: "Field Description", type: "singleLineText"},
+            {key: "fieldOptions", name: "Field Options", type: "singleLineText"},
+            {key: "refId", name: "refId", type: "singleLineText"}
+        ]
+    },
+    {
+        tableId: "dataMappingTable",
+        tableName: "🚢 Data Mapping",
+        fields: [
+            {key: "name", name: "Name", type: "singleLineText"},
+            {key: "shopifyResource", name: "Shopify Resource", type: "singleLineText"},
+            {key: "shopifyField", name: "Shopify Field", type: "singleLineText"},
+            {key: "airtableField", name: "Airtable Field", type: "multipleRecordLinks",
+                options: { 
+                    linkedTableId: ""
+                }
+            },
+            {key: "note", name: "Remarks", type: "multilineText"}
+        ]
+    },
+    {
+        tableId: "syncStatusTable",
+        tableName: "🚢 Sync Status",
+        fields: [
+            {key: "type", name: "Type", type: "singleLineText"},
+            {key: "time", name: "Time", type: "dateTime",
+                options: { 
+                    dateFormat: {
+                        name: "local", 
+                        format: "l"
+                    },
+                    timeFormat: {
+                        name: "24hour",
+                        format: "HH:mm"
+                    },
+                    timeZone: "client"
+                }
+            },
+            {key: "message", name: "Message", type: "multilineText"},
+            {key: "sequence", name: "Sequence", type: "number", options: { precision: 0 }}
+        ]
+    },
+];
+
+// For field name quick referencing
+const tableFieldDict = airshipTables.reduce((acc, cur, i) => {
+    let fields = cur.fields.reduce(( total, current ) => {
+        total[current.key] = current.name;
+        return total;
+    }, {});
+    acc[cur.tableId] = fields;
+    return acc;
+}, {});
+
+// As base.getTable returns error when table not found,
+// This function will return object or null instead of error for better handling
+async function getTable(nameOrId) {
+    try {
+        let table = await base.getTable(nameOrId);
+        return Promise.resolve(table);
+    } catch (e) {
+        return Promise.resolve(null);
+    }
+}
+
+async function getExistingDataKey(table) {
+    var col = {};
+    var results = await table.selectRecordsAsync();
+
+    for (let r of results.records) {
+        let key =  r.getCellValue(tableFieldDict["metadataTable"].refId);
+        col[key] = r.id;
+    }
+
+    return col;
+}
+
+async function createTables() {
+    // For Data Mapping table link records
+    for (let table of airshipTables) {
+        if(table.tableId == "dataMappingTable") {
+            let metaDataTableObj = airshipTables.find(obj => obj.tableId === "metadataTable") || {};
+            let metadataTable = await getTable(metaDataTableObj["tableName"]);
+
+            if(metadataTable) {
+                let objIndex = table.fields.findIndex((obj => obj.key == "airtableField"));
+                table.fields[objIndex].options = {
+                    linkedTableId: metadataTable.id
+                };
+            }
+        }
+        
+        // Check if table is already created
+        let existingTable = base.tables.find(obj => obj.name === table.tableName)
+        if (!existingTable || typeof existingTable == "undefined") {
+            output.text(`Creating ${table.tableName}...`);
+            await base.createTableAsync(table.tableName, table.fields);
+        }
+    }
+
+    return true;
+}
+
+async function updateMetadata() {
+    var tables = base.tables;
+    var metaDataTableObj = airshipTables.find(obj => obj.tableId === "metadataTable") || {};
+    if(!metaDataTableObj["tableName"]) {
+        return Promise.reject("Could not find metadata table object in source");
+    }
+    var metaDataTable = base.getTable(metaDataTableObj["tableName"]);
+    var existingMetadata = await getExistingDataKey(metaDataTable);
+    var newMetadata = [];
+    var updates = [];
+    var creates = [];
+    var deletes = [];
+    //await clearAllRecords(metaDataTable)
+
+    for (let table of tables) {
+        var fields = table.fields;
+
+        // Don't insert Airship tables
+        let isAirshipTable = airshipTables.find(obj => obj.tableName === table.name);
+        if(isAirshipTable || typeof isAirshipTable !== "undefined") {
+            continue;
+        }
+
+        var metadataTableDict = tableFieldDict["metadataTable"];
+
+        for (let i=0; i<fields.length; i++) {
+            let key = fields[i].id;
+            let id = metadataTableDict.id;
+            let tableName = metadataTableDict.tableName;
+            let fieldName = metadataTableDict.fieldName;
+            let fieldType = metadataTableDict.fieldType;
+            let fieldDescription = metadataTableDict.fieldDescription;
+            let refId = metadataTableDict.refId;
+            let payload = {
+                [id]: `${table.name} - ${fields[i].name}`,
+                [tableName]: table.name,
+                [fieldName]: fields[i].name,
+                [fieldType]: fields[i].type,
+                [fieldDescription]: fields[i].description,
+                [refId]: key
+            };
+
+            // For diff later
+            newMetadata.push(key);
+
+            // if field is options
+            let option = fields[i].options;
+            if(option && option.choices && option.choices.length > 0) {
+                payload[metadataTableDict.fieldOptions] = option.choices.map(e => e.name).join(",");
+            }
+
+            // Create new row or update the existing row
+            if (existingMetadata[key] !== undefined) {
+                let recordId = existingMetadata[key];
+                updates.push({
+                    id: recordId,
+                    fields: payload
+                });
+            } else {
+                creates.push({
+                    fields: payload
+                })
+            }
+        }
+    }
+
+    // Delete metadata if fields are removed
+    for(let refId in existingMetadata) {
+        if (!newMetadata.includes(refId)) {
+            deletes.push(existingMetadata[refId]);
+        }
+    }
+
+
+    while (updates.length > 0) {
+        output.text(`Updating ${updates.length} existing records in Metadata table...`);
+        await metaDataTable.updateRecordsAsync(updates.slice(0, 50));
+        updates = updates.slice(50);
+    }
+    
+    while (creates.length > 0) {
+        output.text(`Creating ${creates.length} records in Metadata table...`);
+        await metaDataTable.createRecordsAsync(creates.slice(0, 50));
+        creates = creates.slice(50);
+    }
+
+    while (deletes.length > 0) {
+        output.text(`Removing ${deletes.length} records in Metadata table...`);
+        await metaDataTable.deleteRecordsAsync(deletes.slice(0, 50));
+        deletes = deletes.slice(50);
+    }
+}
+
+async function runAction(action) {
+    var message;
+    var api;
+    switch(action) {
+        case "setup_metadata":
+            message = "Updating Shopify fields in Data Mapping table...";
+            api = apiUrls.dataMapping;
+            break;
+        case "full_sync_s2a":
+            message = "Start synchronizing all Shopify data to Airtable...";
+            api = apiUrls.s2a;
+            break;
+        case "full_sync_a2s":
+            message = `Click this [link](${apiUrls.a2sPeview}) to see preview and start synchronizing.`;
+            api = "";
+            break;
+        case "on_s2a":
+            message = " Enabling data sync from Shopify to Airtable...";
+            api = endPoints.onS2a;
+            break;
+        case "off_s2a":
+            message = "Disabling data sync from Shopify to Airtable...";
+            api = endPoints.offS2a;
+            break;
+        default:
+            message = "";
+            api = "";
+    }
+
+    output.markdown(message);
+
+    if(api !== "") {
+        let response = await remoteFetchAsync(api, {
+            method: "POST",
+            body: new URLSearchParams({
+                "baseId": base.id,
+                "script-version": scriptConfig.version,
+                "shop": scriptConfig.shop
+            }),
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        });
+        return response;
+    }
+}
+
+// Main
+try {
+    const action = ui.action;
+
+    switch(action) {
+        case "setup_metadata":
+            await createTables();
+            await updateMetadata();
+            await runAction(action);
+            break;
+        case "full_sync_s2a":
+            await runAction(action);
+            break;
+        case "full_sync_a2s":
+            await runAction(action);
+            break;
+        case "on_s2a":
+            await runAction(action);
+            break;
+        case "off_s2a":
+            await runAction(action);
+            break;
+        default:
+            output.markdown("Action is not valid")
+    }
+    output.markdown("**Done**");
+
+} catch (e) {
+    output.markdown(
+        `An error has occured. Please share the error message below with our support team if the problem persists.\n
+        ${e}
+        Line: ${e.lineNumber}`
+    )
+}
